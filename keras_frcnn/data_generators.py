@@ -6,6 +6,12 @@ import copy
 from . import data_augment
 import threading
 import itertools
+import os, re
+import codecs
+import matplotlib.pyplot as plt
+
+from glob import glob
+from PIL import Image, ImageDraw, ImageFont
 
 
 def union(au, bu, area_intersection):
@@ -335,3 +341,168 @@ def get_anchor_gt(all_img_data, class_count, C, img_length_calc_function, backen
 			except Exception as e:
 				print(e)
 				continue
+
+                
+def is_valid_str(in_str):
+    regex = r'^[a-z ]+$'
+    search = re.compile(regex, re.UNICODE).search
+    return bool(search(in_str))
+
+
+def build_word_list(num_words, monogram_file, bigram_file, max_string_len=None, mono_fraction=0.5):
+    tmp_string_list = list()
+    string_list = [''] * num_words
+    # monogram file is sorted by frequency in english speech    
+    with codecs.open(monogram_file, mode='r', encoding='utf-8') as f:
+        lines = [line.rstrip('\n') for line in f.readlines()]
+        for line in lines:
+            if len(tmp_string_list) == int(num_words * mono_fraction):
+                break                
+            word = ''.join([random.choice([x.lower(), x]) for x in line])
+            if is_valid_str(word) and (max_string_len == -1 or max_string_len is None or len(word) <= max_string_len):
+                tmp_string_list.append(word)
+
+    # bigram file contains common word pairings in english speech
+    with codecs.open(bigram_file, mode='r', encoding='utf-8') as f:
+        lines = [line.rstrip('\n') for line in f.readlines()]
+        for line in lines:
+            if len(tmp_string_list) == num_words:
+                break
+            columns = line.lower().split()
+            word_line = columns[0] + ' ' + columns[1]
+            word = ''.join([random.choice([x.lower(), x]) for x in word_line])
+            if is_valid_str(word) and (max_string_len == -1 or max_string_len is None or len(word) <= max_string_len):
+                tmp_string_list.append(word)
+    if len(tmp_string_list) != num_words:
+            raise IOError('Could not pull enough words from supplied '
+                          'monogram and bigram files. {} != {}'.format(len(tmp_string_list), num_words))
+
+    # interlace to mix up the easy and hard words
+    string_list[::2] = tmp_string_list[:num_words // 2]
+    string_list[1::2] = tmp_string_list[num_words // 2:]
+    
+    return string_list
+
+
+# re-write paint_text function that support desired font
+def paint_text(texts, w, h, rotate=False, ud=False, multi_fonts=False, multi_font_sizes=False):
+    BASE_DIR = '/content/dohai90/workspace/OCR/korean_ocr'
+    FONTS_BASE_DIR = os.path.join(BASE_DIR, 'fonts/training_fonts')
+    fonts = [font for font in glob(os.path.join(FONTS_BASE_DIR, '*.tt*'))]
+    font_size = 60
+    font_sizes = range(50, 80)
+    img = Image.new('RGB', (w, h), color='white')
+    draw = ImageDraw.Draw(img)
+    
+    bboxes_list = list()
+    img_data = dict()
+    for text in texts:
+#         print(text)
+        if multi_fonts:
+            if multi_font_sizes:
+                font = ImageFont.truetype(np.random.choice(fonts), np.random.choice(font_sizes))
+            else:
+                font = ImageFont.truetype(np.random.choice(fonts), font_size)
+        else:
+            if multi_font_sizes:
+                font = ImageFont.truetype(os.path.join(FONTS_BASE_DIR, 'NanumGothic.ttf'), np.random.choice(font_sizes))
+            else:
+                font = ImageFont.truetype(os.path.join(FONTS_BASE_DIR, 'NanumGothic.ttf'), font_size)              
+                
+        text_bbox_w, text_bbox_h = font.getsize(text)
+        text_bbox_w += 4
+        text_bbox_h += 4
+
+        # teach the RNN translational invariance by 
+        # fitting text box randomly on canvas, with some room to rotate
+        
+        while True:
+            max_shift_x = w - text_bbox_w
+            max_shift_y = h - text_bbox_h
+            top_left_x = np.random.randint(0, int(max_shift_x))    
+            top_left_y = np.random.randint(0, int(max_shift_y))
+            new_bbox = [top_left_x, top_left_y, top_left_x + text_bbox_w, top_left_y + text_bbox_h]
+#             print(new_bbox)
+            
+            overlap = False
+            for box in bboxes_list:
+                drew_bbox = [box['x1'], box['y1'], box['x2'], box['y2']]
+                cal_iou = iou(new_bbox, drew_bbox)
+#                 print(drew_bbox, new_bbox, cal_iou)
+                if cal_iou > 0.05:                     
+                    overlap = True
+                    break
+                
+            if not overlap:
+                draw.text((top_left_x, top_left_y), text, font=font, fill=tuple(np.random.randint(0, 255, 3)))
+                bboxes_list.append({'class': 'obj',
+                                    'text': text,
+                                    'x1': top_left_x,
+                                    'x2': top_left_x + text_bbox_w,
+                                    'y1': top_left_y,
+                                    'y2': top_left_y + text_bbox_h})
+                break
+    img_data['bboxes'] = bboxes_list
+    img_data['width'] = w
+    img_data['height'] = h
+    img_np = np.asarray(img, dtype=np.uint8)
+
+#         if rotate:
+#             img_np = image.random_rotation(img_np, 3 * (w - top_left_x) / w + 1)
+
+#         img_np = speckle(img_np)        
+    return img_data, img_np
+
+
+def get_anchor_gt_ocr(string_list, w, h, C, img_length_calc_function, backend, mode='train' ,rotate=False, ud=False, multi_fonts=False, multi_font_sizes=False):
+    while True:
+#         print('enter while of get_anchor_gt_ocr')
+        try:
+            random.shuffle(string_list)
+            texts = string_list[:random.randint(1, 4)]
+            image_data_aug, x_img = paint_text(texts, w, h, rotate=rotate, ud=ud, multi_fonts=multi_fonts, multi_font_sizes=multi_font_sizes)
+#             plt.imshow(x_img)
+#             plt.show()
+#             print('paint_text done!!!')
+            (width, height) = (image_data_aug['width'], image_data_aug['height'])
+            (rows, cols, _) = x_img.shape
+            
+            assert rows == height
+            assert cols == width
+            
+            # get image dimensions for resizing
+            (resized_width, resized_height) = get_new_img_size(width, height, C.im_size)
+#             print('got here 1')
+            # convert image RGB -> BGR
+#             x_img = x_img[:, :, ::-1]
+            # resize the image so that smaller side has length of 600px
+            x_img = cv2.resize(x_img, (resized_width, resized_height), interpolation=cv2.INTER_CUBIC)
+            
+            try:
+                y_rpn_cls, y_rpn_regr = calc_rpn(C, image_data_aug, width, height, resized_width, resized_height, img_length_calc_function)
+            except:
+                continue
+                
+            # Zero-center by mean pixel, and preprocess image
+#             x_img = x_img[:,:, (2, 1, 0)]  # BGR -> RGB
+            x_img = x_img.astype(np.float32)
+            x_img[:, :, 0] -= C.img_channel_mean[0]
+            x_img[:, :, 1] -= C.img_channel_mean[1]
+            x_img[:, :, 2] -= C.img_channel_mean[2]
+            x_img /= C.img_scaling_factor
+
+            x_img = np.transpose(x_img, (2, 0, 1))
+            x_img = np.expand_dims(x_img, axis=0)
+
+            y_rpn_regr[:, y_rpn_regr.shape[1]//2:, :, :] *= C.std_scaling
+#             print('got here 2')
+
+            if backend == 'tf':
+                x_img = np.transpose(x_img, (0, 2, 3, 1))
+                y_rpn_cls = np.transpose(y_rpn_cls, (0, 2, 3, 1))
+                y_rpn_regr = np.transpose(y_rpn_regr, (0, 2, 3, 1))
+
+            yield np.copy(x_img), [np.copy(y_rpn_cls), np.copy(y_rpn_regr)], image_data_aug
+
+        except Exception as e:
+            print(e)
